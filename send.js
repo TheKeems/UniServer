@@ -1,8 +1,7 @@
-// The data object you want to send
 const dataToSend = {
-    username: 'JohnDoe',
-    email: 'john@example.com',
-    age: 28
+    username: 'test',
+    email: 'test@example.com',
+    age: 67
 };
 
 function send(){
