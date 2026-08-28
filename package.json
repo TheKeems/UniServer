@@ -11,6 +11,7 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "dev:memory": "node dev-memory.mjs",
+    "dev:admin": "node dev-admin.mjs",
     "test": "node --test"
   },
   "dependencies": {
@@ -22,5 +23,8 @@
   },
   "devDependencies": {
     "mongodb-memory-server": "^11.2.0"
+  },
+  "allowScripts": {
+    "mongodb-memory-server@11.2.0": true
   }
 }
