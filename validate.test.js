@@ -7,7 +7,15 @@
 
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { cleanProfile, cleanSubmission, passwordProblem, usernameProblem } from './validate.js'
+import {
+  cleanProfile,
+  cleanSubmission,
+  cleanUniversityContent,
+  passwordProblem,
+  universityIdProblem,
+  urlProblem,
+  usernameProblem,
+} from './validate.js'
 
 describe('usernameProblem', () => {
   it('accepts a plain handle', () => {
@@ -168,5 +176,178 @@ describe('cleanSubmission', () => {
     assert.equal(cleanSubmission({ matchCount: -5 }).matchCount, 0)
     assert.equal(cleanSubmission({ matchCount: 1e9 }).matchCount, 10_000)
     assert.equal(cleanSubmission({ matchCount: 'lots' }).matchCount, 0)
+  })
+})
+
+/* -------------------------------------------------- the new survey answers --- */
+
+describe('cleanAnswers, for the questions added on 2026-08-27', () => {
+  const answers = (over) => cleanProfile({ answers: { field: 'engineering', ...over } }).answers
+
+  it('keeps a home city', () => {
+    assert.equal(answers({ homeCity: 'Mississauga' }).homeCity, 'Mississauga')
+  })
+
+  it('defaults a missing home city to empty, which means "rather not say"', () => {
+    assert.equal(answers({}).homeCity, '')
+  })
+
+  it('truncates a home city rather than rejecting the whole profile', () => {
+    assert.equal(answers({ homeCity: 'x'.repeat(500) }).homeCity.length, 60)
+  })
+
+  it('accepts only the two real co-op answers', () => {
+    assert.equal(answers({ coop: 'yes' }).coop, 'yes')
+    assert.equal(answers({ coop: 'no' }).coop, 'no')
+  })
+
+  it('turns anything else into no preference, never into a filter', () => {
+    // '' means "show me both". Anything that fell through to a truthy value here
+    // would silently halve a student's shortlist.
+    assert.equal(answers({ coop: 'maybe' }).coop, '')
+    assert.equal(answers({ coop: true }).coop, '')
+    assert.equal(answers({}).coop, '')
+  })
+
+  it('keeps a plausible graduating year', () => {
+    assert.equal(answers({ gradYear: 2027 }).gradYear, 2027)
+  })
+
+  it('makes an implausible or missing year null, never 0', () => {
+    assert.equal(answers({ gradYear: 1200 }).gradYear, null)
+    assert.equal(answers({ gradYear: 9999 }).gradYear, null)
+    assert.equal(answers({ gradYear: 'next year' }).gradYear, null)
+    assert.equal(answers({ gradYear: NaN }).gradYear, null)
+    assert.equal(answers({}).gradYear, null)
+  })
+
+  it('truncates rather than rounds, so a year never moves further away', () => {
+    assert.equal(answers({ gradYear: 2027.9 }).gradYear, 2027)
+  })
+
+  // The guard against the four-place change going wrong. If a key is missing
+  // here it is accepted by the API, dropped on the way into Mongo, and erased
+  // from the student's device on their next sign-in elsewhere.
+  it('emits every key the client expects back', () => {
+    assert.deepEqual(Object.keys(answers({})).sort(), [
+      'ambition',
+      'average',
+      'coop',
+      'field',
+      'gradYear',
+      'homeCity',
+      'province',
+    ])
+  })
+})
+
+/* --------------------------------------------------- university content --- */
+
+describe('universityIdProblem', () => {
+  it('accepts the ids the dataset actually uses', () => {
+    for (const id of ['waterloo', 'tmu', 'toronto-scarborough', 'ubc-okanagan', 'rmc']) {
+      assert.equal(universityIdProblem(id), null, id)
+    }
+  })
+
+  it('refuses anything that could reach a query as an operator', () => {
+    // The id goes into a Mongo filter. A '$' or a '.' in it is the classic way
+    // that stops being a string and starts being an instruction.
+    for (const id of ['$ne', 'a.b', '{"$gt":""}', '../etc', 'Waterloo', 'has space']) {
+      assert.ok(universityIdProblem(id), id)
+    }
+  })
+
+  it('refuses an empty or missing id', () => {
+    assert.ok(universityIdProblem(''))
+    assert.ok(universityIdProblem('   '))
+    assert.ok(universityIdProblem(undefined))
+    assert.ok(universityIdProblem(null))
+  })
+})
+
+describe('urlProblem', () => {
+  it('accepts an ordinary link', () => {
+    assert.equal(urlProblem('https://uwaterloo.ca/admissions'), null)
+    assert.equal(urlProblem('http://example.org'), null)
+  })
+
+  it('refuses a scheme that would execute rather than navigate', () => {
+    // These links become anchors on a page students read. An admin panel is not
+    // a trusted input path just because it is behind a password.
+    assert.ok(urlProblem('javascript:alert(1)'))
+    assert.ok(urlProblem('JavaScript:alert(1)'))
+    assert.ok(urlProblem('data:text/html,<script>alert(1)</script>'))
+    assert.ok(urlProblem('vbscript:msgbox(1)'))
+    assert.ok(urlProblem('file:///etc/passwd'))
+  })
+
+  it('refuses a relative link, which would resolve against our own origin', () => {
+    assert.ok(urlProblem('/admissions'))
+    assert.ok(urlProblem('uwaterloo.ca'))
+  })
+})
+
+describe('cleanUniversityContent', () => {
+  it('keeps the copy an admin typed', () => {
+    const { content, problem } = cleanUniversityContent({
+      description: 'A big school in Waterloo.',
+      blurb: 'Co-op capital.',
+      links: [{ label: 'Admissions', url: 'https://uwaterloo.ca/admissions' }],
+    })
+    assert.equal(problem, undefined)
+    assert.equal(content.description, 'A big school in Waterloo.')
+    assert.equal(content.blurb, 'Co-op capital.')
+    assert.deepEqual(content.links, [{ label: 'Admissions', url: 'https://uwaterloo.ca/admissions' }])
+  })
+
+  it('drops fields nobody asked for', () => {
+    const { content } = cleanUniversityContent({
+      description: 'ok',
+      universityId: 'somewhere-else',
+      updatedBy: 'not-me',
+      isAdmin: true,
+    })
+    assert.deepEqual(Object.keys(content).sort(), ['blurb', 'description', 'links'])
+  })
+
+  // Unlike a profile, this REJECTS rather than silently dropping. An admin who
+  // pastes a broken URL needs to be told, not to wonder why the link never
+  // appeared on the site.
+  it('reports a bad link instead of quietly discarding it', () => {
+    const { problem } = cleanUniversityContent({
+      links: [{ label: 'Apply', url: 'javascript:alert(1)' }],
+    })
+    assert.ok(problem)
+  })
+
+  it('reports a link with no label', () => {
+    const { problem } = cleanUniversityContent({ links: [{ url: 'https://example.org' }] })
+    assert.ok(problem)
+  })
+
+  it('ignores a wholly empty link row, which is just an unfilled form field', () => {
+    const { content, problem } = cleanUniversityContent({
+      links: [{ label: '', url: '' }, { label: 'Real', url: 'https://example.org' }],
+    })
+    assert.equal(problem, undefined)
+    assert.equal(content.links.length, 1)
+  })
+
+  it('caps the number of links and the length of the prose', () => {
+    const { content } = cleanUniversityContent({
+      description: 'x'.repeat(9000),
+      blurb: 'y'.repeat(900),
+      links: Array.from({ length: 50 }, (_, i) => ({ label: `l${i}`, url: 'https://example.org' })),
+    })
+    assert.equal(content.description.length, 4000)
+    assert.equal(content.blurb.length, 240)
+    assert.equal(content.links.length, 12)
+  })
+
+  it('survives a body that is not an object at all', () => {
+    assert.equal(cleanUniversityContent(null).content.description, '')
+    assert.equal(cleanUniversityContent('nope').content.description, '')
+    assert.deepEqual(cleanUniversityContent(undefined).content.links, [])
   })
 })
