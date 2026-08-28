@@ -255,7 +255,14 @@ describe('POST /api/auth/signup', () => {
     const raw = await mongoose.connection
       .collection('accounts')
       .findOne({ usernameKey: username.toLowerCase() })
-    assert.ok(!('isAdmin' in raw))
+
+    // `isAdmin` used to stand in here for "a field that does not exist". It
+    // exists now, which makes this assertion stronger rather than weaker: the
+    // client sent `true`, the schema default is `false`, and false is what got
+    // stored. Privilege is granted by hand in the database and no route sets it
+    // — see the note on the field in models.js.
+    assert.equal(raw.isAdmin, false)
+    // Still nothing identifying, ever. An email is not a field this service has.
     assert.ok(!('email' in raw))
   })
 })
@@ -687,5 +694,362 @@ describe('POST /api/data', () => {
     const row = await mongoose.connection.collection('submissions').findOne({}, { sort: { _id: -1 } })
     assert.ok(!('average' in row))
     assert.ok(!('username' in row))
+  })
+})
+
+/* --------------------------------------------------------------- the map --- */
+
+describe('/api/map', () => {
+  it('reports no provider when none is configured, rather than failing', async (t) => {
+    if (!available) return t.skip()
+    // The client uses this to decide whether to draw a real map at all. "No" has
+    // to be an ordinary answer: the SVG fallback is what a student sees, and it
+    // also covers a provider outage, so it must work either way.
+    const { status, body } = await call('/api/map/config')
+    assert.equal(status, 200)
+    assert.equal(body.available, false)
+    assert.ok(body.attribution)
+  })
+
+  it('answers 503 for a tile when no provider is configured', async (t) => {
+    if (!available) return t.skip()
+    const { status, body } = await call('/api/map/tiles/10/100/200')
+    assert.equal(status, 503)
+    assert.equal(body.error.code, 'tiles_not_configured')
+  })
+
+  it('refuses a nonsense tile coordinate before anything is fetched', async (t) => {
+    if (!available) return t.skip()
+    process.env.TILE_URL_TEMPLATE = 'https://tiles.invalid/{z}/{x}/{y}.png'
+    try {
+      for (const path of [
+        '/api/map/tiles/99/1/1',
+        '/api/map/tiles/1/9/1',
+        '/api/map/tiles/abc/1/1',
+        '/api/map/tiles/1/0x10/1',
+      ]) {
+        const { status, body } = await call(path)
+        assert.equal(status, 400, path)
+        assert.equal(body.error.code, 'bad_tile', path)
+      }
+    } finally {
+      delete process.env.TILE_URL_TEMPLATE
+    }
+  })
+
+  it('serves the map even while the database is unreachable', async (t) => {
+    if (!available) return t.skip()
+    // Mounted above the "everything below needs the database" gate on purpose:
+    // a sleeping Atlas should cost you your shortlist, not the basemap.
+    const { status } = await call('/api/map/config')
+    assert.equal(status, 200)
+  })
+})
+
+/* ----------------------------------------------------------- universities --- */
+
+/** Promote an account the only way the service allows: straight in the database. */
+async function makeAdmin(username) {
+  const { Account } = await import('./models.js')
+  await Account.updateOne({ usernameKey: username.toLowerCase() }, { $set: { isAdmin: true } })
+}
+
+describe('/api/universities', () => {
+  it('is readable by anyone, because every student needs it', async (t) => {
+    if (!available) return t.skip()
+    const { status, body } = await call('/api/universities')
+    assert.equal(status, 200)
+    assert.ok(Array.isArray(body.universities))
+  })
+
+  it('tells a signed-in account whether it is an admin', async (t) => {
+    if (!available) return t.skip()
+    const { account, token, username } = await signedUp()
+    assert.equal(account.isAdmin, false)
+
+    await makeAdmin(username)
+    const { body } = await call('/api/auth/me', { token })
+    assert.equal(body.account.isAdmin, true)
+  })
+
+  // Two independent locks: the body is rebuilt field by field, and the schema is
+  // strict. Worth testing because it is the whole privilege model.
+  it('cannot be granted by asking for it at signup', async (t) => {
+    if (!available) return t.skip()
+    const username = someone()
+    const { body } = await call('/api/auth/signup', {
+      method: 'POST',
+      body: { username, password: 'a good long password', isAdmin: true },
+    })
+    assert.equal(body.account.isAdmin, false)
+
+    const me = await call('/api/auth/me', { token: body.token })
+    assert.equal(me.body.account.isAdmin, false)
+  })
+
+  it('refuses a write with no token at all', async (t) => {
+    if (!available) return t.skip()
+    const { status } = await call('/api/universities/waterloo', {
+      method: 'PUT',
+      body: { description: 'nope' },
+    })
+    assert.equal(status, 401)
+  })
+
+  // A 404 rather than a 403, deliberately: a 403 confirms the route is real and
+  // that admin accounts exist to be found.
+  it('hides the route from an ordinary signed-in account', async (t) => {
+    if (!available) return t.skip()
+    const { token } = await signedUp()
+    const { status, body } = await call('/api/universities/waterloo', {
+      method: 'PUT',
+      token,
+      body: { description: 'nope' },
+    })
+    assert.equal(status, 404)
+    assert.equal(body.error.code, 'not_found')
+
+    const after = await call('/api/universities')
+    assert.ok(!after.body.universities.some((u) => u.description === 'nope'))
+  })
+
+  it('lets an admin write, and everyone read it back', async (t) => {
+    if (!available) return t.skip()
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+
+    const put = await call('/api/universities/waterloo', {
+      method: 'PUT',
+      token,
+      body: {
+        description: 'A big school in Waterloo.',
+        blurb: 'Co-op capital.',
+        links: [{ label: 'Admissions', url: 'https://uwaterloo.ca/admissions' }],
+      },
+    })
+    assert.equal(put.status, 200)
+    assert.equal(put.body.university.description, 'A big school in Waterloo.')
+    // Accountability, not attribution: never shown to a student.
+    assert.equal(put.body.university.updatedBy, username)
+
+    const { body } = await call('/api/universities')
+    const waterloo = body.universities.find((u) => u.universityId === 'waterloo')
+    assert.equal(waterloo.blurb, 'Co-op capital.')
+    assert.equal(waterloo.links[0].url, 'https://uwaterloo.ca/admissions')
+  })
+
+  it('replaces rather than merges, like the profile route', async (t) => {
+    if (!available) return t.skip()
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+
+    await call('/api/universities/queens', {
+      method: 'PUT',
+      token,
+      body: { description: 'first', blurb: 'a blurb' },
+    })
+    await call('/api/universities/queens', { method: 'PUT', token, body: { description: 'second' } })
+
+    const { body } = await call('/api/universities')
+    const queens = body.universities.find((u) => u.universityId === 'queens')
+    assert.equal(queens.description, 'second')
+    assert.equal(queens.blurb, '')
+  })
+
+  it('refuses an id that could reach the query as an operator', async (t) => {
+    if (!available) return t.skip()
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+
+    for (const id of ['Waterloo', 'a.b', '$ne']) {
+      const { status, body } = await call(`/api/universities/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        token,
+        body: { description: 'x' },
+      })
+      assert.equal(status, 400, id)
+      assert.equal(body.error.code, 'invalid_university', id)
+    }
+  })
+
+  it('refuses a link that would execute rather than navigate', async (t) => {
+    if (!available) return t.skip()
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+
+    const { status, body } = await call('/api/universities/western', {
+      method: 'PUT',
+      token,
+      body: { links: [{ label: 'Apply', url: 'javascript:alert(1)' }] },
+    })
+    assert.equal(status, 400)
+    assert.equal(body.error.code, 'invalid_content')
+  })
+
+  it('lets an admin delete a record back to "nobody has written this yet"', async (t) => {
+    if (!available) return t.skip()
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+
+    await call('/api/universities/guelph', { method: 'PUT', token, body: { description: 'x' } })
+    const del = await call('/api/universities/guelph', { method: 'DELETE', token })
+    assert.equal(del.status, 204)
+
+    const { body } = await call('/api/universities')
+    assert.ok(!body.universities.some((u) => u.universityId === 'guelph'))
+  })
+
+  it('will not let an ordinary account delete', async (t) => {
+    if (!available) return t.skip()
+    const { token: adminToken, username } = await signedUp()
+    await makeAdmin(username)
+    await call('/api/universities/trent', {
+      method: 'PUT',
+      token: adminToken,
+      body: { description: 'keep' },
+    })
+
+    const { token } = await signedUp()
+    const { status } = await call('/api/universities/trent', { method: 'DELETE', token })
+    assert.equal(status, 404)
+
+    const { body } = await call('/api/universities')
+    assert.ok(body.universities.some((u) => u.universityId === 'trent'))
+  })
+})
+
+/* -------------------------------------------- the three new survey answers --- */
+
+describe('the survey answers added on 2026-08-27', () => {
+  it('round-trips home city, co-op and graduating year', async (t) => {
+    if (!available) return t.skip()
+    // The failure this guards against: an answer accepted by the API, dropped on
+    // the way into Mongo, and erased from the device on the next sign-in
+    // somewhere else. Silent in every log.
+    const { token } = await signedUp()
+    await call('/api/profile', {
+      method: 'PUT',
+      token,
+      body: {
+        answers: {
+          field: 'engineering',
+          province: 'ON',
+          average: 88,
+          ambition: 'balanced',
+          homeCity: 'Mississauga',
+          coop: 'yes',
+          gradYear: 2027,
+        },
+      },
+    })
+
+    const { body } = await call('/api/profile', { token })
+    assert.equal(body.profile.answers.homeCity, 'Mississauga')
+    assert.equal(body.profile.answers.coop, 'yes')
+    assert.equal(body.profile.answers.gradYear, 2027)
+  })
+
+  it('keeps a skipped answer as its no-preference value', async (t) => {
+    if (!available) return t.skip()
+    const { token } = await signedUp()
+    await call('/api/profile', { method: 'PUT', token, body: { answers: { field: '' } } })
+    const { body } = await call('/api/profile', { token })
+    assert.equal(body.profile.answers.homeCity, '')
+    assert.equal(body.profile.answers.coop, '')
+    assert.equal(body.profile.answers.gradYear, null)
+  })
+})
+
+/* ------------------------------------- what the public listing gives away --- */
+
+describe('GET /api/universities does not publish who the admins are', () => {
+  it('omits updatedBy for an anonymous reader', async (t) => {
+    if (!available) return t.skip()
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+    await call('/api/universities/brock', { method: 'PUT', token, body: { description: 'x' } })
+
+    const { body } = await call('/api/universities')
+    const brock = body.universities.find((u) => u.universityId === 'brock')
+    // updatedBy is an admin's username. Publishing it to every student hands
+    // out the list of accounts worth attacking, and undoes the reason
+    // requireAdmin answers 404 rather than 403.
+    assert.ok(brock)
+    assert.equal(brock.updatedBy, undefined)
+    // updatedAt stays: "last checked in March" is useful and names nobody.
+    assert.ok(brock.updatedAt)
+  })
+
+  it('omits it for a signed-in ordinary account too', async (t) => {
+    if (!available) return t.skip()
+    const { token: adminToken, username } = await signedUp()
+    await makeAdmin(username)
+    await call('/api/universities/windsor', { method: 'PUT', token: adminToken, body: { description: 'x' } })
+
+    const { token } = await signedUp()
+    const { body } = await call('/api/universities', { token })
+    const windsor = body.universities.find((u) => u.universityId === 'windsor')
+    assert.equal(windsor.updatedBy, undefined)
+  })
+
+  it('includes it for an admin, which is what the panel needs', async (t) => {
+    if (!available) return t.skip()
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+    await call('/api/universities/lakehead', { method: 'PUT', token, body: { description: 'x' } })
+
+    const { body } = await call('/api/universities', { token })
+    const lakehead = body.universities.find((u) => u.universityId === 'lakehead')
+    assert.equal(lakehead.updatedBy, username)
+  })
+})
+
+describe('the university id is what gets stored', () => {
+  it('trims before storing, so a padded id cannot make an orphan document', async (t) => {
+    if (!available) return t.skip()
+    // universityIdProblem validates the TRIMMED value. Storing the raw one let
+    // " nipissing" pass the check and then sit in the collection under an id no
+    // university has — copy that looks like it failed to appear.
+    const { token, username } = await signedUp()
+    await makeAdmin(username)
+
+    const { status } = await call('/api/universities/%20nipissing', {
+      method: 'PUT',
+      token,
+      body: { description: 'padded' },
+    })
+    assert.equal(status, 200)
+
+    const { body } = await call('/api/universities')
+    assert.ok(body.universities.some((u) => u.universityId === 'nipissing'))
+    assert.ok(!body.universities.some((u) => u.universityId !== u.universityId.trim()))
+  })
+})
+
+describe('the admin refusal is indistinguishable from a real miss', () => {
+  it('matches the app-level 404 body exactly', async (t) => {
+    if (!available) return t.skip()
+    // A 404 that is one character different from a genuine 404 announces that
+    // the route exists and that admin accounts are worth hunting for.
+    const { token } = await signedUp()
+    const refused = await call('/api/universities/carleton', {
+      method: 'PUT',
+      token,
+      body: { description: 'x' },
+    })
+    const genuine = await call('/api/nothing-here/carleton', {
+      method: 'PUT',
+      token,
+      body: { description: 'x' },
+    })
+
+    assert.equal(refused.status, 404)
+    assert.equal(genuine.status, 404)
+    assert.equal(refused.body.error.code, genuine.body.error.code)
+    assert.equal(
+      refused.body.error.message,
+      'No route for PUT /api/universities/carleton.',
+    )
+    assert.equal(genuine.body.error.message, 'No route for PUT /api/nothing-here/carleton.')
   })
 })
