@@ -5,30 +5,36 @@ Accounts, profile storage and survey telemetry for Acceptiversity. Node + Expres
 
 ## Read this first
 
-**The live service does not have these routes yet.** As of 2026-08-18 it answers
-`POST /api/data` and 404s everything else — including `GET /`. Probe it yourself:
+**The accounts half of this is live.** As of 2026-08-28,
+`https://uniserver-632q.onrender.com/api/health` answers
+`{"ok":true,"database":"connected"}` and `GET /` returns the service banner — so
+this codebase is deployed and both required environment variables are set. The
+service refuses to start without `JWT_SECRET`, so a healthy response is proof of
+that on its own.
+
+**The university-content and map routes are not deployed yet.** `GET
+/api/universities` still 404s. Probe before assuming either way:
 
 ```bash
 curl -i https://uniserver-632q.onrender.com/api/health
+curl -i https://uniserver-632q.onrender.com/api/universities
 ```
 
-A 404 means this code has not been deployed and the site's account pages will show
-*"Accounts aren't available on the server yet"* (a specific message, so nobody
-wastes an afternoon thinking they mistyped a password). Everything else on the site
-works regardless — an account is optional there, not a gate.
+A 404 on the second one is the state the site is built for: `loadUniversityContent`
+resolves to `{}`, the map falls back to its hand-drawn SVG, and nothing else
+changes. An account is optional on the site, not a gate.
 
 **`POST /api/data` is preserved exactly as it was**: anonymous, no account id, a
-five-point average band rather than an exact average. If the deployed repo already
-has its own implementation of that route, keep theirs — check the collection name
-matches (`submissions` here) before dropping this file in.
+five-point average band rather than an exact average.
 
 ## What it stores
 
 | Collection | Fields |
 | --- | --- |
-| `accounts` | `username`, `usernameKey` (lowercase, unique), `passwordHash`, `createdAt`, `lastSeenAt` |
-| `profiles` | `accountId`, `answers` (field, province, **average**, ambition), `shortlist`, `courses`, `notes`, `tags`, `savedAt` |
+| `accounts` | `username`, `usernameKey` (lowercase, unique), `passwordHash`, `isAdmin`, `createdAt`, `lastSeenAt` |
+| `profiles` | `accountId`, `answers` (field, province, **average**, ambition, homeCity, coop, gradYear), `shortlist`, `courses`, `notes`, `tags`, `savedAt` |
 | `submissions` | `field`, `province`, `averageBand`, `ambition`, `matchCount` — no account id |
+| `universitycontents` | `universityId`, `description`, `blurb`, `links`, `updatedAt`, `updatedBy` — prose only, never a number |
 
 No email, no real name, no age, no school, in any collection. The audience is
 mostly minors and the project's rule is that it collects nothing identifying; a
@@ -53,6 +59,8 @@ upgrades a row silently at the next successful login.
 | `MONGODB_URI` | yes | Atlas connection string, including the database name |
 | `JWT_SECRET` | yes | 32+ random characters. The service refuses to start without it |
 | `ALLOWED_ORIGINS` | no | Comma-separated. Omit to allow any origin |
+| `TILE_URL_TEMPLATE` | no | Map tiles, e.g. `https://…/{z}/{x}/{y}.png?key=…`. Omit and the site keeps its SVG map |
+| `TILE_ATTRIBUTION` | no | Shown on the map. Defaults to OpenStreetMap credit |
 | `PORT` | no | Render sets this |
 
 Generate a secret:
@@ -89,6 +97,27 @@ persisted between restarts:
 npm install            # includes mongodb-memory-server; downloads a mongod binary once
 npm run dev:memory     # http://localhost:3001
 ```
+
+To open the **admin panel** locally you need an admin account, and admin is granted by hand in the
+database — which you do not have on a throwaway in-memory one. `dev:admin` is `dev:memory` plus
+"promote these usernames the moment they exist":
+
+```bash
+npm run dev:admin -- yourname
+```
+
+Sign up as `yourname` in the site and the panel appears. Local only: the database it promotes in
+is in memory and vanishes when the process stops, so this cannot touch a deployment.
+
+To see the real map rather than the SVG fallback, give it a tile provider:
+
+```bash
+TILE_URL_TEMPLATE="https://tile.openstreetmap.org/{z}/{x}/{y}.png" npm run dev:memory
+```
+
+That URL is fine for a few minutes of local testing. **Do not point production at it** —
+OpenStreetMap's tile policy does not allow a proxy in front of it. Use a provider you have an
+account with (MapTiler, Stadia, Thunderforest); the key stays in the environment either way.
 
 With a real MongoDB:
 
@@ -140,11 +169,68 @@ shown to a student as-is; the client branches on `code`.
 | `PUT /api/profile` | Bearer | whole profile → `{profile}` |
 | `DELETE /api/account` | Bearer | → `204` (account + profile) |
 | `POST /api/data` | — | anonymous telemetry → `201 {ok:true}` |
+| `GET /api/universities` | — | → `{universities}` — editable copy, public |
+| `PUT /api/universities/:id` | Bearer + **admin** | `{description, blurb, links}` → `{university}` |
+| `DELETE /api/universities/:id` | Bearer + **admin** | → `204` |
+| `GET /api/map/config` | — | → `{available, attribution}` |
+| `GET /api/map/tiles/:z/:x/:y` | — | → an image |
 | `GET /api/health` | — | → `{ok, database}` |
 
 Codes a client may see: `invalid_username`, `invalid_password`, `username_taken`,
 `invalid_credentials`, `wrong_password`, `unauthorized`, `rate_limited`,
-`database_unavailable`, `too_large`, `bad_json`, `not_found`, `server_error`.
+`database_unavailable`, `too_large`, `bad_json`, `not_found`, `server_error`,
+`invalid_university`, `invalid_content`, `tiles_not_configured`, `bad_tile`,
+`tile_unavailable`, `tile_missing`.
+
+### Admins
+
+`isAdmin` on an account is what gates the two write routes above. **There is no
+route that sets it.** An endpoint that grants admin is an endpoint that can be
+tricked into granting admin, and the number of admins here is small and changes
+rarely, so it is a shell command:
+
+```
+db.accounts.updateOne({ usernameKey: 'yourname' }, { $set: { isAdmin: true } })
+```
+
+`GET /api/auth/me` reports `isAdmin` so the site knows whether to show the admin
+screen. That is a convenience for rendering, never a permission — `requireAdmin`
+re-reads the database on every write, because a token says who you are and only
+the database says what you may do.
+
+A non-admin hitting an admin route gets **404, not 403**. A 403 confirms the route
+is real and that admin accounts exist to be found.
+
+### The map tile proxy
+
+`GET /api/map/tiles/:z/:x/:y` fetches one tile from `TILE_URL_TEMPLATE` and streams
+it back. Two reasons it exists rather than pointing Leaflet straight at a provider:
+the API key stays in Render's environment instead of a public static bundle, and
+the provider sees this service rather than a student's IP and every map movement
+they make — which is what lets `src/lib/api.ts` keep saying there is no third party.
+
+The client supplies **three integers and nothing else**. The URL is assembled from
+a template only the operator sets, zoom is capped at 19, and `x`/`y` must fall
+inside the 2^z grid that zoom actually has. `tiles.test.js` covers the attempts:
+`1e2`, `0x10`, `' 1 '`, `../`, and anything shaped like a host.
+
+With `TILE_URL_TEMPLATE` unset, `/api/map/config` reports `available: false` and the
+site keeps the hand-drawn SVG map it has always had. That is a supported state, not
+a broken one — and it is the same fallback that covers a provider outage or a
+sleeping instance.
+
+### University content
+
+`universitycontents` holds **prose only**: a description, a one-line blurb, some
+links. Names, cities, provinces, program counts and every reported average stay in
+the spreadsheet → `npm run data:build` → static JSON pipeline in the site repo,
+where the moderation and the provenance rules live. Nothing here can contradict a
+number, because nothing here holds a number.
+
+It is additive, never authoritative. The site renders identically when the
+collection is empty or the service is asleep: `loadUniversityContent` resolves to
+`{}` on failure rather than rejecting, so a cold start costs a paragraph of prose,
+not a page.
 
 `PUT /api/profile` replaces. The device holds the working copy and this is its
 backup, so a server-side merge would produce a shortlist that is neither copy. Last

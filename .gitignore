@@ -1,0 +1,20 @@
+# Dependencies. package-lock.json IS committed — Render builds with `npm ci`,
+# which needs it and fails without it.
+node_modules/
+
+# Secrets. MONGODB_URI and JWT_SECRET are set in Render's environment, never in
+# a file in the repo. If you make one of these locally, it stays local.
+.env
+.env.*
+!.env.example
+
+# mongodb-memory-server caches the mongod binary it downloads.
+.cache/
+.mongodb-binaries/
+
+# Logs and editor noise
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/

@@ -5,8 +5,10 @@
 
 import express from 'express'
 import cors from 'cors'
+import rateLimit from 'express-rate-limit'
 import { isConnected } from './db.js'
 import { routes } from './routes.js'
+import { proxyTile, tileAttribution, tileTemplate, tileUrl } from './tiles.js'
 
 export function createApp() {
   const app = express()
@@ -61,6 +63,56 @@ export function createApp() {
   app.get('/api/health', (_req, res) => {
     const ready = isConnected()
     res.status(ready ? 200 : 503).json({ ok: ready, database: ready ? 'connected' : 'unavailable' })
+  })
+
+  /* ------------------------------------------------------------- the map --- */
+  // Mounted ABOVE the database gate below, because a basemap has nothing to do
+  // with Mongo. A sleeping Atlas should cost you your shortlist, not the map.
+
+  /**
+   * What the client needs to decide whether to draw a real map at all.
+   *
+   * `available: false` is a supported answer, not an error: with no provider
+   * configured the client keeps the hand-drawn SVG map it has always had. That
+   * fallback also covers a provider outage, so it has to work either way — and
+   * asking once here is cheaper than discovering it through failed tiles.
+   */
+  app.get('/api/map/config', (_req, res) => {
+    res.json({ available: Boolean(tileTemplate()), attribution: tileAttribution() })
+  })
+
+  /**
+   * One tile.
+   *
+   * Rate limited well above what a person panning a map generates and well below
+   * what would empty a provider quota. Tiles are cached hard by the browser, so
+   * a real session makes far fewer requests than it looks like it should.
+   */
+  const tileLimit = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 600,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: { code: 'rate_limited', message: 'Too many map tiles at once.' } },
+  })
+
+  app.get('/api/map/tiles/:z/:x/:y', tileLimit, (req, res) => {
+    const { url, problem } = tileUrl(req.params.z, req.params.x, req.params.y)
+    if (problem === 'not_configured') {
+      return res.status(503).json({
+        error: { code: 'tiles_not_configured', message: 'No map provider is configured.' },
+      })
+    }
+    if (problem) {
+      return res
+        .status(400)
+        .json({ error: { code: 'bad_tile', message: 'That is not a valid tile coordinate.' } })
+    }
+    return proxyTile(url, res).catch(() =>
+      res
+        .status(502)
+        .json({ error: { code: 'tile_unavailable', message: 'The map provider did not respond.' } }),
+    )
   })
 
   /**

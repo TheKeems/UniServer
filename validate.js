@@ -88,6 +88,7 @@ function cleanAnswers(answers) {
   if (!answers || typeof answers !== 'object') return null
 
   const average = answers.average
+  const gradYear = answers.gradYear
   return {
     field: cleanString(answers.field, 40),
     province: cleanString(answers.province, 4),
@@ -96,6 +97,115 @@ function cleanAnswers(answers) {
         ? average
         : null,
     ambition: ['safe', 'balanced', 'reach'].includes(answers.ambition) ? answers.ambition : 'balanced',
+    // The three questions added on 2026-08-27. Every one has to appear here, or
+    // the answer is accepted, dropped, and never seen again — this function
+    // REBUILDS the stored answers rather than merging into them.
+    homeCity: cleanString(answers.homeCity, 60),
+    coop: ['yes', 'no'].includes(answers.coop) ? answers.coop : '',
+    // Bounded to something a human could plausibly graduate in, and truncated
+    // rather than rounded so 2027.9 is 2027 and not a year further away.
+    gradYear:
+      typeof gradYear === 'number' &&
+      Number.isFinite(gradYear) &&
+      gradYear >= 1900 &&
+      gradYear <= 2200
+        ? Math.trunc(gradYear)
+        : null,
+  }
+}
+
+/* ----------------------------------------------------- university content --- */
+
+/** Caps on editable copy, so one save cannot fill the database. */
+const CONTENT_LIMITS = {
+  universityId: 60,
+  description: 4000,
+  blurb: 240,
+  links: 12,
+  linkLabel: 80,
+  linkUrl: 500,
+}
+
+/**
+ * The id in the URL of a content route.
+ *
+ * Restricted to the shape the dataset actually uses — `waterloo`, `tmu`,
+ * `toronto-scarborough` — rather than accepting anything and trusting Mongo to
+ * cope. A permissive id here is how a `$`-prefixed or dotted key reaches a
+ * query, and it also stops the admin panel quietly creating documents for typos
+ * that then sit in the collection matching no university at all.
+ */
+export function universityIdProblem(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return 'A university id is required.'
+  const id = raw.trim()
+  if (id.length > CONTENT_LIMITS.universityId) {
+    return `University id must be at most ${CONTENT_LIMITS.universityId} characters.`
+  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
+    return 'University id may only contain lowercase letters, numbers and hyphens.'
+  }
+  return null
+}
+
+/**
+ * Only http and https, and only absolute.
+ *
+ * `javascript:` is the reason this exists. These links are rendered as anchors
+ * on a page students read, and an admin panel is not a trusted input path just
+ * because it is behind a password — the entire point of storing a URL is that
+ * a person typed it. `new URL` also rejects the relative and scheme-relative
+ * forms, which would otherwise resolve against our own origin.
+ */
+export function urlProblem(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return 'A link needs a URL.'
+  const value = raw.trim()
+  if (value.length > CONTENT_LIMITS.linkUrl) {
+    return `A link URL must be at most ${CONTENT_LIMITS.linkUrl} characters.`
+  }
+  let parsed
+  try {
+    parsed = new URL(value)
+  } catch {
+    return 'That link is not a valid URL. Include https://.'
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return 'Links must start with http:// or https://.'
+  }
+  return null
+}
+
+/**
+ * Rebuild editable university copy from a request body.
+ *
+ * Unlike `cleanProfile`, this one CAN reject: it returns `{ problem }` for a bad
+ * link rather than dropping it. A profile is a student's own data and losing one
+ * malformed entry beats losing the whole save. This is published copy, and an
+ * admin who pastes a broken URL needs to be told — not to have it vanish and
+ * spend an afternoon wondering why the link never appeared on the site.
+ */
+export function cleanUniversityContent(body) {
+  const source = body && typeof body === 'object' ? body : {}
+
+  const rawLinks = Array.isArray(source.links) ? source.links.slice(0, CONTENT_LIMITS.links) : []
+  const links = []
+  for (const entry of rawLinks) {
+    if (!entry || typeof entry !== 'object') continue
+    const label = cleanString(entry.label, CONTENT_LIMITS.linkLabel)
+    const url = typeof entry.url === 'string' ? entry.url.trim() : ''
+    // A wholly empty row is an unfilled form field, not a mistake worth an error.
+    if (!label && !url) continue
+    const problem = urlProblem(url)
+    if (problem) return { problem }
+    if (!label) return { problem: 'Every link needs a label.' }
+    links.push({ label, url })
+  }
+
+  return {
+    content: {
+      description: cleanString(source.description, CONTENT_LIMITS.description),
+      blurb: cleanString(source.blurb, CONTENT_LIMITS.blurb),
+      links,
+    },
   }
 }
 
